@@ -1,8 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from urllib.parse import urlparse, urlunparse
-from playwright.sync_api import sync_playwright
-import time
+from urllib.parse import urlparse, urlunparse, urljoin
+import requests
 
 app = FastAPI()
 
@@ -17,50 +16,57 @@ def clean_url(url: str) -> str:
 def health():
     return {"status": "ok"}
 
+def resolve_redirects(url: str) -> tuple[str, list[str]]:
+    session = requests.Session()
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Connection": "close"
+    }
+
+    current_url = url
+    chain = [current_url]
+
+    for _ in range(10):
+        try:
+            response = session.get(
+                current_url,
+                headers=headers,
+                allow_redirects=False,
+                timeout=(8, 8),
+                stream=True
+            )
+
+            status = response.status_code
+            location = response.headers.get("Location")
+            response.close()
+
+            if status in [301, 302, 303, 307, 308] and location:
+                next_url = urljoin(current_url, location)
+                current_url = next_url
+                chain.append(current_url)
+                continue
+
+            return current_url, chain
+
+        except requests.exceptions.ReadTimeout:
+            return current_url, chain
+
+        except requests.exceptions.ConnectTimeout:
+            return current_url, chain
+
+    return current_url, chain
+
 @app.post("/resolve")
 def resolve(payload: ResolveRequest):
     try:
-        start_host = urlparse(payload.url).netloc
-        final_url = payload.url
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-http2"
-                ]
-            )
-
-            page = browser.new_page(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            )
-
-            try:
-                page.goto(payload.url, wait_until="commit", timeout=15000)
-            except Exception:
-                pass
-
-            deadline = time.time() + 20
-
-            while time.time() < deadline:
-                current_url = page.url
-                current_host = urlparse(current_url).netloc
-
-                if current_url != "about:blank":
-                    final_url = current_url
-
-                if current_host and current_host != start_host:
-                    break
-
-                page.wait_for_timeout(500)
-
-            browser.close()
+        final_url, chain = resolve_redirects(payload.url)
 
         return {
             "final_url": final_url,
-            "clean_url": clean_url(final_url)
+            "clean_url": clean_url(final_url),
+            "redirect_chain": chain
         }
 
     except Exception as e:
